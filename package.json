@@ -14,7 +14,7 @@
   },
   "dependencies": {
     "@jsquash/webp": "^1.4.0",
-    "@silvia-odwyer/photon": "^0.3.2",
+    "@silvia-odwyer/photon": "0.3.2",
     "query-string": "^8.1.0"
   },
   "pnpm": {
