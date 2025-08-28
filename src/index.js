@@ -67,10 +67,7 @@ export default {
 
 		if (!url) {
 			return new Response(null, {
-				status: 302,
-				headers: {
-					location: 'https://github.com/ccbikai/cloudflare-worker-image',
-				},
+				status: 404,
 			});
 		}
 
