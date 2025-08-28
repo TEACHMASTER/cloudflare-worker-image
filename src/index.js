@@ -32,21 +32,39 @@ const inWhiteList = (env, url) => {
 const processImage = async (env, request, inputImage, pipeAction) => {
 	const [action, options = ''] = pipeAction.split('!');
 	const params = options.split(',');
+	if (typeof photon[action] !== 'function') {
+		throw new Error(`Unsupported action: ${action}`);
+	}
+	if (action === 'resize') {
+		// resize 参数转为数字
+		const [w, h, interp] = params.map(Number);
+		const beforeW = inputImage.get_width();
+		const beforeH = inputImage.get_height();
+		const resized = photon.resize(inputImage, w, h, interp);
+		const afterW = resized.get_width();
+		const afterH = resized.get_height();
+		console.log('[resize]', 'from', beforeW, beforeH, 'to', w, h, 'interp', interp, 'result', afterW, afterH);
+		return resized;
+	}
 	if (multipleImageMode.includes(action)) {
-		const image2 = params.shift(); // 是否需要 decodeURIComponent ?
-		if (image2 && inWhiteList(env, image2)) {
-			const image2Res = await fetch(image2, { headers: request.headers });
+		const image2 = params.shift();
+		const image2Url = image2 ? decodeURIComponent(image2) : '';
+		if (image2Url && inWhiteList(env, image2Url)) {
+			const image2Res = await fetch(image2Url, { headers: request.headers });
 			if (image2Res.ok) {
 				const inputImage2 = photon.PhotonImage.new_from_byteslice(new Uint8Array(await image2Res.arrayBuffer()));
-				// 多图处理是处理原图
-				photon[action](inputImage, inputImage2, ...params);
+				try {
+					photon[action](inputImage, inputImage2, ...params);
+				} finally {
+					inputImage2.ptr && inputImage2.free && inputImage2.free();
+				}
 				return inputImage; // 多图模式返回第一张图
 			}
 		}
 	} else {
 		return photon[action](inputImage, ...params);
 	}
-};
+	};
 
 export default {
 	async fetch(request, env, context) {
@@ -63,8 +81,8 @@ export default {
 		// 入参提取与校验
 		const query = queryString.parse(new URL(request.url).search);
 		const { url = '', action = '', format = 'webp', quality = 99 } = query;
-		console.log('params:', url, action, format, quality);
-
+		const qualityNum = Number(quality) || 99;
+		console.log('params:', url, action, format, qualityNum);
 		if (!url) {
 			return new Response(null, {
 				status: 404,
@@ -84,33 +102,61 @@ export default {
 		if (!imageRes.ok) {
 			return imageRes;
 		}
-		console.log('fetch image done');
+		const contentLength = imageRes.headers.get('content-length');
+		if (contentLength && Number(contentLength) > 8 * 1024 * 1024) { // 8MB 限制
+			return new Response('Image too large', { status: 413 });
+		}
+		console.log('fetch image done', imageRes.status, imageRes.headers.get('content-type'), contentLength);
 
 		const imageBytes = new Uint8Array(await imageRes.arrayBuffer());
+		if (imageBytes.length > 8 * 1024 * 1024) {
+			return new Response('Image too large', { status: 413 });
+		}
+		let inputImage, outputImage;
 		try {
-			const inputImage = photon.PhotonImage.new_from_byteslice(imageBytes);
+			inputImage = photon.PhotonImage.new_from_byteslice(imageBytes);
 			console.log('create inputImage done');
 
 			/** pipe
 			 * `resize!800,400,1|watermark!https%3A%2F%2Fmt.ci%2Flogo.png,10,10,10,10`
 			 */
 			const pipe = action.split('|');
-			const outputImage = await pipe.filter(Boolean).reduce(async (result, pipeAction) => {
-				result = await result;
-				return (await processImage(env, request, result, pipeAction)) || result;
-			}, inputImage);
+			outputImage = await pipe.filter(Boolean).reduce(async (result, pipeAction) => {
+				// 释放上一个中间态，避免内存堆积
+				const prev = await result;
+				let next;
+				try {
+					next = await processImage(env, request, prev, pipeAction);
+				} finally {
+					if (prev && prev !== inputImage && prev.ptr && prev.free) {
+						try { prev.free(); } catch (e) { /* ignore */ }
+					}
+				}
+				return next || prev;
+			}, Promise.resolve(inputImage));
 			console.log('create outputImage done');
 
-			// 图片编码
+
+			// 图片编码前加宽高和像素数限制，防止 webp 编码 OOM
 			let outputImageData;
-			if (format === 'jpeg' || format === 'jpg') {
-				outputImageData = outputImage.get_bytes_jpeg(quality)
+			const width = outputImage.get_width();
+			const height = outputImage.get_height();
+			if (format === 'webp') {
+				if (width * height > 16 * 1024 * 1024 || width > 8000 || height > 8000) {
+					return new Response('Image dimensions too large for webp', { status: 413 });
+				}
+				outputImageData = await encodeWebp(outputImage.get_image_data(), { quality: qualityNum });
+			} else if (format === 'jpeg' || format === 'jpg') {
+				outputImageData = outputImage.get_bytes_jpeg(qualityNum)
 			} else if (format === 'png') {
 				outputImageData = outputImage.get_bytes()
-			} else {
-				outputImageData = await encodeWebp(outputImage.get_image_data(), { quality });
 			}
-			console.log('create outputImageData done');
+			console.log('create outputImageData done', outputImageData && outputImageData.length);
+
+			if (!outputImageData) {
+				console.error('outputImageData is empty or undefined');
+				return new Response('Image encode failed', { status: 500 });
+			}
 
 			// 返回体构造
 			const imageResponse = new Response(outputImageData, {
@@ -121,8 +167,12 @@ export default {
 			});
 
 			// 释放资源
-			inputImage.ptr && inputImage.free();
-			outputImage.ptr && outputImage.free();
+			if (inputImage && inputImage.ptr && inputImage.free) {
+				try { inputImage.free(); } catch (e) { /* ignore */ }
+			}
+			if (outputImage && outputImage.ptr && outputImage.free && outputImage !== inputImage) {
+				try { outputImage.free(); } catch (e) { /* ignore */ }
+			}
 			console.log('image free done');
 
 			// 写入缓存
@@ -130,6 +180,12 @@ export default {
 			return imageResponse;
 		} catch (error) {
 			console.error('process:error', error.name, error.message, error);
+			if (inputImage && inputImage.ptr && inputImage.free) {
+				try { inputImage.free(); } catch (e) { /* ignore */ }
+			}
+			if (outputImage && outputImage.ptr && outputImage.free && outputImage !== inputImage) {
+				try { outputImage.free(); } catch (e) { /* ignore */ }
+			}
 			const errorResponse = new Response(imageBytes || null, {
 				headers: imageRes.headers,
 				status: 'RuntimeError' === error.name ? 415 : 500,
